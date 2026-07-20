@@ -1,0 +1,52 @@
+name: 飆股篩選 Telegram 推播
+
+on:
+  schedule:
+    # 台北 21:00 (收盤資料已穩定) = UTC 13:00, 平日
+    - cron: '0 13 * * 1-5'
+      timezone: 'Asia/Taipei'
+  # 手動觸發 (Actions 分頁會出現 Run workflow 按鈕)
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: '參數組合 conservative/standard/aggressive'
+        type: string
+        default: 'standard'
+
+jobs:
+  screen:
+    runs-on: ubuntu-latest
+    # 全市場全掃 + 大量畫圖, 給足時間 (不在意快慢)
+    timeout-minutes: 180
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: 安裝中文字型 (K 線圖顯示中文)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq fonts-noto-cjk fontconfig
+          fc-cache -f
+
+      - name: 安裝 Python 套件
+        run: pip install -r requirements.txt
+
+      - name: 執行飆股篩選並推播
+        env:
+          TZ: Asia/Taipei
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MOMENTUM_PRESET: ${{ inputs.preset || 'standard' }}
+          INCLUDE_OTC: '1'
+          SCAN_WORKERS: '10'
+          CHART_PERIOD: '1y'
+          SEND_SLEEP: '3'
+          MAX_PER_STRATEGY: '0'   # 0 = 全推 (每 6 檔一張圖)
+        run: python run_screener.py
