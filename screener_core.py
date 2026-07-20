@@ -20,11 +20,55 @@ import time
 import platform
 from datetime import datetime, timedelta
 
+import random
 import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
 import yfinance as yf
+
+
+# ------------------------------------------------------------------
+#   yfinance 抗限流層
+#   1) 用 curl_cffi 瀏覽器指紋 session, 大幅降低 Yahoo 429
+#   2) 帶指數退避重試的 history() 包裝
+# ------------------------------------------------------------------
+try:
+    from curl_cffi import requests as _cffi_requests
+    _YF_SESSION = _cffi_requests.Session(impersonate="chrome")
+    print("[INFO] 已啟用 curl_cffi 瀏覽器指紋 session (降低 yfinance 限流)")
+except Exception as _e:  # 沒裝 curl_cffi 也能跑, 只是較易被限流
+    _YF_SESSION = None
+    print(f"[WARN] curl_cffi 不可用, 改用預設連線: {_e}")
+
+
+def _yf_ticker(ticker: str):
+    if _YF_SESSION is not None:
+        try:
+            return yf.Ticker(ticker, session=_YF_SESSION)
+        except TypeError:      # 舊版 yfinance 不吃 session 參數
+            return yf.Ticker(ticker)
+    return yf.Ticker(ticker)
+
+
+def _history_retry(ticker: str, retries: int = 5, base_sleep: float = 2.0,
+                   **kwargs) -> pd.DataFrame:
+    """帶重試/指數退避的 history(); 專門對付 'Too Many Requests'。"""
+    last_exc = None
+    for attempt in range(retries):
+        try:
+            return _yf_ticker(ticker).history(**kwargs)
+        except Exception as e:
+            last_exc = e
+            msg = str(e).lower()
+            if ("too many requests" in msg or "rate limit" in msg
+                    or "429" in msg):
+                time.sleep(base_sleep * (2 ** attempt) + random.uniform(0, 1.5))
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    return pd.DataFrame()
 
 
 class StrategyParams:
@@ -220,6 +264,7 @@ class MarketUniverseFetcher:
       • 抓取失敗時 fallback 到「上次成功的清單」(last_good.json),
         連 last_good 都沒有才回傳空 (呼叫端據此中止並提示, 不會偷掃小清單)
     """
+    TWSE_OPENAPI_URL = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
     TWSE_URL = "https://www.twse.com.tw/exchangeReport/STOCK_DAY_ALL"
     TPEX_URL = ("https://www.tpex.org.tw/openapi/v1/"
                 "tpex_mainboard_daily_close_quotes")
@@ -264,15 +309,23 @@ class MarketUniverseFetcher:
         # 3) 實際抓取
         cls._last_error = ""
         pool: dict[str, str] = {}
+        n_twse = n_tpex = 0
         try:
-            pool.update(cls._fetch_twse())      # 上市
+            twse = cls._fetch_twse()            # 上市
+            n_twse = len(twse)
+            pool.update(twse)
         except Exception as e:
             cls._last_error += f"[上市] {e}  "
+            print(f"[WARN] 上市清單抓取失敗: {e}")
         if include_otc:
             try:
-                pool.update(cls._fetch_tpex())  # 上櫃
+                tpex = cls._fetch_tpex()        # 上櫃
+                n_tpex = len(tpex)
+                pool.update(tpex)
             except Exception as e:
                 cls._last_error += f"[上櫃] {e}  "
+                print(f"[WARN] 上櫃清單抓取失敗: {e}")
+        print(f"[INFO] 清單來源: 上市 {n_twse} 檔, 上櫃 {n_tpex} 檔")
 
         # 4) 成功 → 存快取 + last_good
         if pool:
@@ -340,6 +393,14 @@ class MarketUniverseFetcher:
     # ---------- 上市 (證交所 STOCK_DAY_ALL) ----------
     @classmethod
     def _fetch_twse(cls) -> dict[str, str]:
+        # 先試 OpenAPI (list of dict, 較適合自動化)
+        try:
+            pool = cls._fetch_twse_openapi()
+            if pool:
+                return pool
+        except Exception as e:
+            print(f"[WARN] 上市 OpenAPI 失敗, 改試舊端點: {e}")
+        # 退回 www STOCK_DAY_ALL
         r = requests.get(cls.TWSE_URL, params={"response": "json"},
                          headers=cls.HEADERS, timeout=cls.TIMEOUT)
         if r.status_code != 200:
@@ -374,6 +435,28 @@ class MarketUniverseFetcher:
                 pool[f"{code}.TW"] = name
         if not pool:
             raise RuntimeError("解析後 0 檔 (格式可能已變動)")
+        return pool
+
+    @classmethod
+    def _fetch_twse_openapi(cls) -> dict[str, str]:
+        """上市: TWSE OpenAPI (回傳 list of dict, 每筆含 Code/Name)。"""
+        r = requests.get(cls.TWSE_OPENAPI_URL, headers=cls.HEADERS,
+                         timeout=cls.TIMEOUT)
+        if r.status_code != 200:
+            raise RuntimeError(f"HTTP {r.status_code}")
+        data = r.json()
+        if not isinstance(data, list) or not data:
+            raise RuntimeError("OpenAPI 回應非預期 (空或非列表)")
+        code_key = cls._find_key(data[0], "Code", "代號")
+        name_key = cls._find_key(data[0], "Name", "名稱")
+        if code_key is None or name_key is None:
+            raise RuntimeError(f"找不到代號/名稱鍵: {list(data[0].keys())}")
+        pool = {}
+        for item in data:
+            code = str(item.get(code_key, "")).strip()
+            name = str(item.get(name_key, "")).strip()
+            if cls._is_common_stock(code):
+                pool[f"{code}.TW"] = name
         return pool
 
     # ---------- 上櫃 (TPEx openapi) ----------
@@ -454,7 +537,8 @@ class StockDataFetcher:
             end_dt = datetime.now() + timedelta(days=1)    # 明天 = 確保涵蓋今天
             start_dt = end_dt - timedelta(days=days)
 
-            df = yf.Ticker(ticker).history(
+            df = _history_retry(
+                ticker,
                 start=start_dt.strftime("%Y-%m-%d"),
                 end=end_dt.strftime("%Y-%m-%d"),
                 auto_adjust=False,
@@ -486,7 +570,8 @@ class StockDataFetcher:
         try:
             start_dt = pd.to_datetime(start) - timedelta(days=100)
             end_dt   = pd.to_datetime(end) + timedelta(days=2)
-            df = yf.Ticker(ticker).history(
+            df = _history_retry(
+                ticker,
                 start=start_dt.strftime("%Y-%m-%d"),
                 end=end_dt.strftime("%Y-%m-%d"),
                 auto_adjust=False,
@@ -959,11 +1044,12 @@ class MomentumScreener:
             if end_date:
                 end_dt = pd.to_datetime(end_date)
                 start_dt = end_dt - timedelta(days=lookback * 2)
-                twii = yf.Ticker("^TWII").history(
+                twii = _history_retry(
+                    "^TWII",
                     start=start_dt.strftime("%Y-%m-%d"),
                     end=(end_dt + timedelta(days=1)).strftime("%Y-%m-%d"))
             else:
-                twii = yf.Ticker("^TWII").history(period="6mo")
+                twii = _history_retry("^TWII", period="6mo")
             if twii.empty:
                 return set(), None
             if twii.index.tz is not None:

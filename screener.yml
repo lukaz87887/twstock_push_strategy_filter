@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       preset:
-        description: '參數組合 conservative/standard/aggressive'
+        description: '參數組合 conservative/standard/aggressive (留空則用 Variables 設定)'
         type: string
-        default: 'standard'
+        default: ''
 
 jobs:
   screen:
@@ -43,10 +43,12 @@ jobs:
           TZ: Asia/Taipei
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          MOMENTUM_PRESET: ${{ inputs.preset || 'standard' }}
-          INCLUDE_OTC: '1'
-          SCAN_WORKERS: '10'
-          CHART_PERIOD: '1y'
-          SEND_SLEEP: '3'
-          MAX_PER_STRATEGY: '0'   # 0 = 全推 (每 6 檔一張圖)
+          # 以下優先讀 Repository Variables, 讀不到才用預設值
+          # (手動觸發時若在 preset 欄位輸入值, 會覆蓋 Variables)
+          MOMENTUM_PRESET: ${{ inputs.preset || vars.MOMENTUM_PRESET || 'standard' }}
+          INCLUDE_OTC: ${{ vars.INCLUDE_OTC || '1' }}
+          SCAN_WORKERS: ${{ vars.SCAN_WORKERS || '3' }}
+          CHART_PERIOD: ${{ vars.CHART_PERIOD || '1y' }}
+          SEND_SLEEP: ${{ vars.SEND_SLEEP || '3' }}
+          MAX_PER_STRATEGY: ${{ vars.MAX_PER_STRATEGY || '0' }}
         run: python run_screener.py

@@ -6,3 +6,4 @@ matplotlib>=3.7
 mplfinance>=0.12.10b0
 Pillow>=10.0
 requests>=2.31
+curl_cffi>=0.7
