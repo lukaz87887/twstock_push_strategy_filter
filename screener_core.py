@@ -20,6 +20,7 @@ import time
 import platform
 from datetime import datetime, timedelta
 
+import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
