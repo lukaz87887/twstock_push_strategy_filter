@@ -20,7 +20,7 @@ import time
 import platform
 from datetime import datetime, timedelta
 
-import requests          # ← 就是這行, 一定要有
+import requests
 import numpy as np
 import pandas as pd
 from scipy.stats import linregress
