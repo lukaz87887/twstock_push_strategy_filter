@@ -73,7 +73,8 @@ class CandlestickPlotter:
     @classmethod
     def plot(cls, fig: Figure, df: pd.DataFrame, title: str,
              extra: dict = None, simple_mode: bool = False,
-             inst_series: pd.DataFrame = None):
+             inst_series: pd.DataFrame = None,
+             big_holder: pd.DataFrame = None):
         """
         在 fig 上繪製: K 線 + (可選)投信買賣量 + 量能
         extra : 額外資訊, 用於繪製策略特定的標記
@@ -108,7 +109,15 @@ class CandlestickPlotter:
 
         # ★ v9.4: 三圖佈局 (K 線 + 投信 + 量能) 或兩圖 (K 線 + 量能)
         ax_inst = None
-        if inst_series is not None and not inst_series.empty:
+        ax_bh = None
+        has_bh = big_holder is not None and not big_holder.empty
+        if has_bh and (inst_series is None or inst_series.empty):
+            # 三圖: K(6) + 量能(2) + 大戶持股(2) = 10 列
+            gs = fig.add_gridspec(10, 1, hspace=0.08)
+            ax_main = fig.add_subplot(gs[0:6, 0])
+            ax_vol  = fig.add_subplot(gs[6:8, 0], sharex=ax_main)
+            ax_bh   = fig.add_subplot(gs[8:10, 0], sharex=ax_main)
+        elif inst_series is not None and not inst_series.empty:
             # 三圖: K(6) + 投信(2) + 量能(2) = 10 列
             gs = fig.add_gridspec(10, 1, hspace=0.08)
             ax_main = fig.add_subplot(gs[0:6, 0])
@@ -214,6 +223,13 @@ class CandlestickPlotter:
             except Exception as e:
                 print(f"[WARN] 投信副圖繪製失敗: {e}")
 
+        # ====== 大戶持股 (≥400 張) 週資料副圖 ======
+        if ax_bh is not None:
+            try:
+                cls._draw_big_holder(ax_bh, ax_vol, plot_df, big_holder)
+            except Exception as e:
+                print(f"[WARN] 大戶副圖繪製失敗: {e}")
+
         # ====== v7 新增: 策略特定標記 ======
         if extra:
             cls._draw_extra_markers(ax_main, df, plot_df, extra)
@@ -242,6 +258,50 @@ class CandlestickPlotter:
         fig.tight_layout()
         # ★ v9.4: return 加上 ax_inst (None 表示沒有投信副圖)
         return ax_main, ax_vol, plot_df, ax_inst
+
+    @classmethod
+    def _draw_big_holder(cls, ax_bh, ax_vol, plot_df, big_holder):
+        """把週資料 (date, ratio) 對齊到 K 棒位置畫折線; 最後一週變動標在左上角"""
+        idx = pd.DatetimeIndex(plot_df.index).normalize()
+        xs, ys = [], []
+        for _, row in big_holder.sort_values("date").iterrows():
+            d = pd.Timestamp(str(row["date"])).normalize()
+            if d < idx[0] or d > idx[-1] + pd.Timedelta(days=7):
+                continue
+            pos = int(idx.searchsorted(d, side="right")) - 1  # 該週最後一根 K 棒
+            if pos < 0:
+                continue
+            xs.append(min(pos, len(idx) - 1))
+            ys.append(float(row["ratio"]))
+
+        ax_bh.set_ylabel("大戶持股%\n(≥400張)", fontsize=9)
+        ax_bh.tick_params(axis="y", labelsize=8)
+        ax_bh.grid(True, linestyle=":", alpha=0.3)
+        ax_vol.tick_params(axis="x", labelbottom=False)   # 日期改顯示在最下面
+        if not xs:
+            ax_bh.text(0.5, 0.5, "無大戶週資料", ha="center", va="center",
+                       fontsize=9, transform=ax_bh.transAxes, color="#888")
+            return
+
+        ax_bh.plot(xs, ys, color="#6A1B9A", linewidth=1.6,
+                   marker="o", markersize=3.5, zorder=3)
+        # 最後一週的線段: 增加紅 / 減少綠
+        if len(xs) >= 2:
+            chg = ys[-1] - ys[-2]
+            seg_color = "#C62828" if chg > 0 else "#2E7D32" if chg < 0 else "#888"
+            ax_bh.plot(xs[-2:], ys[-2:], color=seg_color, linewidth=2.6,
+                       marker="o", markersize=5, zorder=4)
+            label = f"大戶 {ys[-1]:.2f}%   週變動 {chg:+.2f} pp"
+        else:
+            seg_color = "#6A1B9A"
+            label = f"大戶 {ys[-1]:.2f}%"
+        ax_bh.text(0.01, 0.92, label, transform=ax_bh.transAxes,
+                   fontsize=9, fontweight="bold", va="top", color=seg_color,
+                   bbox=dict(boxstyle="round,pad=0.25", fc="white",
+                             ec=seg_color, alpha=0.9))
+        lo, hi = min(ys), max(ys)
+        pad = max((hi - lo) * 0.25, 0.5)
+        ax_bh.set_ylim(lo - pad, hi + pad * 1.6)   # 上方多留給標籤
 
     @classmethod
     def _draw_extra_markers(cls, ax_main, df_full, plot_df, extra):
@@ -409,13 +469,18 @@ class CandlestickPlotter:
 # ==================================================================
 def render_stock_png(df: pd.DataFrame, title: str, extra: dict = None,
                      width_px: int = 900, height_px: int = 720,
-                     dpi: int = 100) -> bytes | None:
-    """把單一檔股票畫成 K 線技術圖, 回傳 PNG bytes。"""
+                     dpi: int = 100,
+                     big_holder: pd.DataFrame = None) -> bytes | None:
+    """把單一檔股票畫成 K 線技術圖, 回傳 PNG bytes。
+    big_holder: DataFrame[date(YYYYMMDD), ratio] → K 線下方加大戶持股副圖"""
     if df is None or df.empty:
         return None
+    if big_holder is not None and not big_holder.empty:
+        height_px = int(height_px * 1.15)   # 多一個副圖, 稍微加高
     fig = Figure(figsize=(width_px / dpi, height_px / dpi), dpi=dpi)
     try:
-        CandlestickPlotter.plot(fig, df, title, extra=extra, simple_mode=False)
+        CandlestickPlotter.plot(fig, df, title, extra=extra, simple_mode=False,
+                                big_holder=big_holder)
         buf = io.BytesIO()
         fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight",
                     facecolor="white")
