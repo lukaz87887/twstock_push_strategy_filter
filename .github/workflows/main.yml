@@ -2,8 +2,9 @@ name: 飆股篩選 Telegram 推播
 
 on:
   schedule:
-    # 台北 21:00 (收盤資料已穩定) = UTC 13:00, 平日
-    - cron: '0 13 * * 1-5'
+    # ★ 有 timezone 欄位時, cron 直接寫「台北時間」(不是 UTC)
+    #   舊版寫 '0 13' 以為是 UTC → 實際在台北 13:00 (盤中!) 執行, 已修正
+    - cron: '10 21 * * 1-5'     # 平日 台北 21:10 (收盤資料已穩定)
       timezone: 'Asia/Taipei'
   # 手動觸發 (Actions 分頁會出現 Run workflow 按鈕)
   workflow_dispatch:
@@ -12,6 +13,11 @@ on:
         description: '參數組合 conservative/standard/aggressive (留空則用 Variables 設定)'
         type: string
         default: ''
+
+# 同一時間只跑一個 (避免手動+排程重疊, 重複推播)
+concurrency:
+  group: screener
+  cancel-in-progress: false
 
 jobs:
   screen:
@@ -38,6 +44,14 @@ jobs:
       - name: 安裝 Python 套件
         run: pip install -r requirements.txt
 
+      # 集保大戶週資料快取 (歷史週不會變, 存起來之後每檔只需補最新一週)
+      - name: 還原大戶持股快取
+        uses: actions/cache@v4
+        with:
+          path: .tdcc_cache
+          key: tdcc-${{ github.run_id }}
+          restore-keys: tdcc-
+
       - name: 執行飆股篩選並推播
         env:
           TZ: Asia/Taipei
@@ -51,4 +65,13 @@ jobs:
           CHART_PERIOD: ${{ vars.CHART_PERIOD || '1y' }}
           SEND_SLEEP: ${{ vars.SEND_SLEEP || '3' }}
           MAX_PER_STRATEGY: ${{ vars.MAX_PER_STRATEGY || '0' }}
+          # 推哪些策略 (逗號分隔): standard,channel,rs_strong
+          STRATEGIES: ${{ vars.STRATEGIES || 'standard,channel,rs_strong' }}
+          # 大戶持股 (≥400 張) 週變動條件
+          BIG_HOLDER_FILTER: ${{ vars.BIG_HOLDER_FILTER || '1' }}     # 1=開 0=關
+          BIG_HOLDER_MIN_CHG: ${{ vars.BIG_HOLDER_MIN_CHG || '2' }}   # 週增 > 2 個百分點
+          BIG_HOLDER_WEEKS: ${{ vars.BIG_HOLDER_WEEKS || '26' }}      # 圖上畫幾週
+          TDCC_CACHE_DIR: .tdcc_cache
+          # 手動觸發 = 強制執行 (略過休市判斷)
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '1' || '0' }}
         run: python run_screener.py
